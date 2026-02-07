@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 # reMarkable pdf export TUI:
 # browse filesystem and instantly export and open documents in chrome
-# depends on RCU
+# depends on RCU (https://www.davisr.me/projects/rcu/)
 
 set -eo pipefail
 
-SSH_HOST="remarkable-usb"
-CHROME_CMD=$(command -v google-chrome || command -v google-chrome-stable)
-EXPORT_DIR="/tmp"
-CACHE_DIR="/tmp/rm-export"
-CACHE_TTL=1200 # 20 min
+SSH_HOST="remarkable-usb" # see README
+OPEN_CMD="$(command -v google-chrome-stable) %s &>/dev/null &" # open after export (%s=abs filepath)
+RCU_EXPORT_FORMAT="--export-pdf-rm" # see rcu --help
+EXPORT_DIR_1="/tmp" # i use (enter) for one-time viewing
+EXPORT_DIR_2="$HOME/downloads" # i use these for actually exporting
+EXPORT_KEY_2="ctrl-d" 
+CACHE_DIR="/tmp/rm-export-meta" # document metadata is cached here (script will need it)
+CACHE_TTL=1200 # seconds
 
 mkdir -p "$CACHE_DIR"
 
-# handle Ctrl+C gracefully
 trap 'exit 0' INT TERM
 
 cache_fresh() {
@@ -21,7 +23,6 @@ cache_fresh() {
     [[ -f "$cache_file" ]] && [[ $(($(date +%s) - $(stat -c %Y "$cache_file"))) -lt $CACHE_TTL ]]
 }
 
-# fetch all data and build cache index
 refresh_cache() {
     printf "Loading data from reMarkable...\n" >&2
 
@@ -29,7 +30,7 @@ refresh_cache() {
     local collections_full_file="$CACHE_DIR/collections_full.txt"
     local documents_file="$CACHE_DIR/documents.txt"
 
-    # fetch collections with parent info (skip trash)
+    # fetch collections with parent info
     ssh "$SSH_HOST" '
         cd /home/root/.local/share/remarkable/xochitl/
         count=0
@@ -39,12 +40,11 @@ refresh_cache() {
             if [ $((count % 30)) -eq 0 ]; then
                 printf "\rLoading collections... %d/%d" "$count" "$total" >&2
             fi
-            # Match both "type": "CollectionType" and "type":"CollectionType"
             if grep -q "\"type\".*CollectionType" "$f" 2>/dev/null; then
                 id="${f%.metadata}"
                 name=$(grep "\"visibleName\":" "$f" | sed "s/.*\"visibleName\": *\"\([^\"]*\)\".*/\1/")
                 parent=$(grep "\"parent\":" "$f" | sed "s/.*\"parent\": *\"\([^\"]*\)\".*/\1/")
-                # Skip trash and deleted collections
+                # skip deleted
                 if [[ "$parent" != "trash" ]] && ! grep -q "\"deleted\" *true" "$f" 2>/dev/null; then
                     echo "$id	$name	$parent"
                 fi
@@ -66,9 +66,8 @@ refresh_cache() {
             if [ $((count % 30)) -eq 0 ]; then
                 printf "\rLoading documents... %d/%d" "$count" "$total" >&2
             fi
-            # Match both "type": "DocumentType" and "type":"DocumentType"
             if grep -q "\"type\".*DocumentType" "$f" 2>/dev/null; then
-                # Skip deleted documents
+                # skip deleted
                 if ! grep -q "\"deleted\" *true" "$f" 2>/dev/null; then
                     id="${f%.metadata}"
                     name=$(grep "\"visibleName\":" "$f" | sed "s/.*\"visibleName\": *\"\([^\"]*\)\".*/\1/")
@@ -85,7 +84,7 @@ refresh_cache() {
 
     awk -F'\t' '
     BEGIN {
-        # First pass: load all collections into memory
+        # load all collections into memory
         while ((getline < "'"$collections_full_file"'") > 0) {
             id = $1
             name = $2
@@ -96,12 +95,12 @@ refresh_cache() {
         }
     }
     END {
-        # Second pass: build paths for each collection
+        # build paths for each collection
         for (i = 1; i <= count; i++) {
             id = ids[i]
             path_parts[0] = collections[id]
 
-            # Walk up parents
+            # walk up parents
             current_id = parents[id]
             depth = 0
             max_depth = 10
@@ -111,7 +110,7 @@ refresh_cache() {
                 current_id = parents[current_id]
             }
 
-            # Build path in reverse order (root first)
+            # build path in reverse order
             full_path = ""
             for (j = depth; j >= 0; j--) {
                 if (full_path != "") full_path = full_path "/"
@@ -154,25 +153,57 @@ get_collection_name() {
     if [[ "$collection_id" == "ALL" ]]; then
         echo "All Documents"
     else
-        # try to get the full path from paths file first, fall back to just the name
+        # try to get the full path from paths file first
         local full_path
         full_path=$(awk -F'\t' -v cid="$collection_id" '$1 == cid {print $2; exit}' "$CACHE_DIR/collections_paths.txt" 2>/dev/null)
         if [[ -n "$full_path" ]]; then
             echo "$full_path"
         else
+            # fall back to just the name
             awk -F'\t' -v cid="$collection_id" '$1 == cid {print $2; exit}' "$CACHE_DIR/collections_full.txt"
         fi
     fi
 }
 
-# navigate to parent collection
+export_document() {
+    local doc_id="$1"
+    local name="$2"
+    local key_pressed="$3"
+
+    local safe_name
+    safe_name=$(echo "$name" | tr -cd '[:alnum:].,_ -' | tr ' ' '_' | sed 's/^\.*//')
+
+    local export_dir
+    if [[ "$key_pressed" == "$EXPORT_KEY_2" ]]; then
+        export_dir="$EXPORT_DIR_2"
+    else
+        export_dir="$EXPORT_DIR_1"
+    fi
+
+    local pdf_path="$export_dir/${safe_name}.pdf"
+
+    echo "Exporting '$name'..." >&2
+    # change the grep args to filter out noise from RCU output
+    rcu --cli --no-check-compat --autoconnect "$RCU_EXPORT_FORMAT" "$doc_id" "$pdf_path" 2>&1 | grep -vE "could not get|Some data|template broken|cat: can't open|set_color_by_index|==.*==>|^saving$" || true
+    echo "Done! Exported to: $pdf_path" >&2
+    # output path to open it later
+    echo "$pdf_path"
+}
+
+open_in_browser() {
+    local pdf_path="$1"
+    if [[ -n "$OPEN_CMD" ]]; then
+        eval "$(printf "$OPEN_CMD" "$pdf_path")"
+    fi
+}
+
 navigate_to_parent() {
     local current_id="$1"
     local parent_id
     parent_id=$(get_collection_parent "$current_id")
 
     if [[ -z "$parent_id" || "$parent_id" == "" ]]; then
-        # At root level, go back to collection picker
+        # main menu
         echo ""
     else
         echo "$parent_id"
@@ -182,10 +213,13 @@ navigate_to_parent() {
 main() {
     FORCE_REFRESH=false
 
-    # Parse arguments
     for arg in "$@"; do
         case "$arg" in
-            --refresh|-r)
+            --help|-h)
+                echo "usage: rm-export.sh [--refresh_cache|-r] [--help|-h]"
+                exit 0
+                ;;
+            --refresh_cache|-r)
                 FORCE_REFRESH=true
                 ;;
         esac
@@ -213,21 +247,18 @@ main() {
 
         # build list: documents + subcollections in this collection
         local items=()
-        local header="[Enter: Export | Esc: Parent]"
+        local header="[Esc: Back | Tab: Select | Enter: Export $EXPORT_DIR_1 | Ctrl-D: Export $EXPORT_DIR_2]"
 
-        # ".." to go to parent (if not ALL)
+        # ".." to go to parent
         if [[ "$current_collection_id" != "ALL" ]]; then
             local parent_id
             parent_id=$(get_collection_parent "$current_collection_id")
             if [[ -n "$parent_id" && "$parent_id" != "" ]]; then
-                # get parent collection name for display
                 local parent_name
                 parent_name=$(get_collection_name "$parent_id")
-                # use just the base name, not full path
                 parent_name=$(echo "$parent_name" | awk -F'/' '{print $NF}')
                 items+=("PARENT:$parent_id	..	($parent_name)")
             else
-                # at root level, ".." goes to main menu
                 items+=("MAIN	..	(main menu)")
             fi
         fi
@@ -261,47 +292,55 @@ main() {
 
         local selected
         selected=$(echo -n "$combined" | fzf --prompt="[$current_collection_name] " --delimiter='\t' --with-nth=2 \
-            --header="$header" --tabstop=1) || { current_collection_id=""; current_collection_name=""; continue; }
+            --header="$header" --tabstop=1 --expect="$EXPORT_KEY_2" --multi) || { current_collection_id=""; current_collection_name=""; continue; }
+
+        # check secondary export key
+        local key_pressed=""
+        if [[ "$(echo "$selected" | head -n 1)" == "$EXPORT_KEY_2" ]]; then
+            key_pressed="$EXPORT_KEY_2"
+            selected=$(echo "$selected" | tail -n +2)
+        fi
 
         [[ -z "$selected" ]] && continue
 
-        local first_field
-        first_field=$(echo "$selected" | cut -f1)
+        # check for navigation items
+        while IFS=$'\t' read -r item_id _; do
+            [[ -z "$item_id" ]] && continue
 
-        if [[ "$first_field" == "MAIN" ]]; then
-            # go to main menu
-            current_collection_id=""
-            current_collection_name=""
-            continue
-        fi
+            if [[ "${item_id:0:5}" == "COLL:" ]]; then
+                # navigate into subcollection
+                current_collection_id="${item_id:5}"
+                current_collection_name=$(get_collection_name "$current_collection_id")
+                continue 2
+            fi
 
-        if [[ "${first_field:0:7}" == "PARENT:" ]]; then
-            # go to parent collection
-            current_collection_id="${first_field:7}"
-            current_collection_name=$(get_collection_name "$current_collection_id")
-            continue
-        fi
+            if [[ "$item_id" == "MAIN" ]]; then
+                # go to main menu
+                current_collection_id=""
+                current_collection_name=""
+                continue 2
+            fi
 
-        if [[ "${first_field:0:5}" == "COLL:" ]]; then
-            # user selected a subcollection
-            current_collection_id="${first_field:5}"
-            current_collection_name=$(get_collection_name "$current_collection_id")
-            continue
-        fi
+            if [[ "${item_id:0:7}" == "PARENT:" ]]; then
+                # go to parent
+                current_collection_id="${item_id:7}"
+                current_collection_name=$(get_collection_name "$current_collection_id")
+                continue 2
+            fi
+        done <<< "$selected"
 
-        # user selected a document
-        local doc_id name
-        doc_id=$(echo "$selected" | cut -f1)
-        name=$(echo "$selected" | cut -f2)
+        # export documents
+        local pdf_paths=()
+        while IFS=$'\t' read -r doc_id name; do
+            [[ -z "$doc_id" ]] && continue
+            local pdf_path
+            pdf_path=$(export_document "$doc_id" "$name" "$key_pressed")
+            pdf_paths+=("$pdf_path")
+        done <<< "$selected"
 
-        local safe_name
-        safe_name=$(echo "$name" | tr -cd '[:alnum:].,_ -' | tr ' ' '_' | sed 's/^\.*//')
-        local pdf_path="$EXPORT_DIR/${safe_name}.pdf"
-
-        echo "Exporting '$name'..."
-        rcu --cli --no-check-compat --autoconnect --export-pdf-v "$doc_id" "$pdf_path" 2>&1 | grep -vE "could not get|Some data|template broken|cat: can't open|set_color_by_index|==.*==>|^saving$" || true
-        $CHROME_CMD "$pdf_path" &>/dev/null &
-        echo "Done! Exported to: $pdf_path"
+        for pdf_path in "${pdf_paths[@]}"; do
+            open_in_browser "$pdf_path"
+        done
     done
 }
 
